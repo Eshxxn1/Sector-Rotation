@@ -71,6 +71,9 @@ COLORS: Dict[str, str] = {
 }
 
 
+# Track whether Yahoo Finance was reachable (set by fetch_data)
+_yahoo_reachable = True
+
 # ===================================================================
 # 1. DATA FETCHING
 # ===================================================================
@@ -139,6 +142,7 @@ def fetch_data(
     weekly : pd.DataFrame   – Friday-resampled weekly closes (all tickers + benchmark + cash)
     daily  : pd.DataFrame   – daily closes (for volatility calcs)
     """
+    global _yahoo_reachable
     close = None
 
     if not offline:
@@ -159,6 +163,7 @@ def fetch_data(
             print(f"[WARN] yfinance download failed: {exc}")
 
     if close is None or close.empty:
+        _yahoo_reachable = False
         print("[INFO] Using synthetic data (Yahoo Finance unavailable or --offline mode).")
         print("[INFO] Results are illustrative only — connect to the internet for live signals.")
         close = _generate_synthetic_data(tickers, benchmark, cash, years)
@@ -256,6 +261,7 @@ def factor_scores(
     daily: pd.DataFrame,
     tickers: List[str],
     api_key: Optional[str] = None,
+    offline: bool = False,
 ) -> pd.DataFrame:
     """Compute cross-sectional z-scores for each factor.
 
@@ -290,7 +296,7 @@ def factor_scores(
 
         # --- Value / Quality / Size proxies via yfinance.info ---
         info: dict = {}
-        if api_key is not None or api_key is None:
+        if not offline:
             try:
                 info = yf.Ticker(ticker).info or {}
             except Exception:
@@ -373,7 +379,11 @@ def composite_signal(
     # Recommendation
     merged["recommendation"] = merged.apply(_recommend, axis=1)
 
-    return merged.reset_index()
+    result = merged.reset_index()
+    # Ensure 'ticker' is always a column (not stuck in the index)
+    if "ticker" not in result.columns and result.index.name == "ticker":
+        result = result.reset_index()
+    return result
 
 
 def _recommend(row: pd.Series) -> str:
@@ -973,6 +983,9 @@ def main() -> None:
     # --- Fetch Data ---
     weekly, daily = fetch_data(SECTOR_TICKERS, years=args.years, offline=args.offline)
 
+    # Detect if we fell back to synthetic data (Yahoo was unreachable)
+    is_offline = args.offline or not _yahoo_reachable
+
     # --- RRG ---
     rrg_df = compute_rrg(weekly, SECTOR_TICKERS, BENCHMARK,
                          rs_lookback=args.horizon_weeks,
@@ -984,8 +997,10 @@ def main() -> None:
     rrg_latest = rrg_df[rrg_df["date"] == latest_date].copy()
 
     # --- Factor Scores ---
-    print("[INFO] Computing factor scores (fetching fundamentals may be slow) ...")
-    factors = factor_scores(weekly, daily, SECTOR_TICKERS, api_key=args.api_key)
+    if not is_offline:
+        print("[INFO] Computing factor scores (fetching fundamentals may be slow) ...")
+    factors = factor_scores(weekly, daily, SECTOR_TICKERS, api_key=args.api_key,
+                            offline=is_offline)
 
     # --- Composite Signal ---
     signals = composite_signal(rrg_latest, factors, args.rrg_weight, args.factor_weight)
