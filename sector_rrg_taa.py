@@ -354,7 +354,12 @@ def composite_signal(
     Composite = rrg_weight * normalised(mean(RS-Ratio, RS-Mom)) + factor_weight * top-2 factor z avg
     Then z-score across sectors.
     """
-    merged = rrg_latest.set_index("ticker").join(factors[["factor_z_avg", "top2_factor_z"]], how="inner")
+    # Bring factor columns alongside RRG data via explicit merge on ticker
+    factor_cols = factors[["factor_z_avg", "top2_factor_z"]].copy()
+    factor_cols.index.name = "ticker"
+    factor_cols = factor_cols.reset_index()  # ticker becomes a column
+
+    merged = rrg_latest.merge(factor_cols, on="ticker", how="inner")
 
     # Normalise RRG component: average of RS-Ratio and RS-Momentum, then z-score
     merged["rrg_raw"] = (merged["rs_ratio"] + merged["rs_momentum"]) / 2
@@ -379,11 +384,7 @@ def composite_signal(
     # Recommendation
     merged["recommendation"] = merged.apply(_recommend, axis=1)
 
-    result = merged.reset_index()
-    # Ensure 'ticker' is always a column (not stuck in the index)
-    if "ticker" not in result.columns and result.index.name == "ticker":
-        result = result.reset_index()
-    return result
+    return merged
 
 
 def _recommend(row: pd.Series) -> str:
