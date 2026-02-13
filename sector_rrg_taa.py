@@ -74,38 +74,94 @@ COLORS: Dict[str, str] = {
 # ===================================================================
 # 1. DATA FETCHING
 # ===================================================================
+def _generate_synthetic_data(
+    tickers: List[str],
+    benchmark: str,
+    cash: str,
+    years: int,
+) -> pd.DataFrame:
+    """Generate realistic synthetic daily price data for demonstration.
+
+    Each ticker gets a correlated random walk with sector-specific drift and
+    volatility, producing plausible relative-strength dynamics.
+    """
+    np.random.seed(42)
+    all_tickers = list(dict.fromkeys(tickers + [benchmark, cash]))
+    end = dt.date.today()
+    start = end - dt.timedelta(days=365 * years + 90)
+    dates = pd.bdate_range(start, end)
+    n = len(dates)
+
+    # Sector-specific annualised drift / vol (rough real-world estimates)
+    params: Dict[str, Tuple[float, float]] = {
+        "XLK": (0.14, 0.20), "XLF": (0.09, 0.19), "XLV": (0.10, 0.15),
+        "XLY": (0.11, 0.21), "XLP": (0.07, 0.12), "XLI": (0.10, 0.18),
+        "XLE": (0.04, 0.28), "XLU": (0.06, 0.14), "XLRE": (0.07, 0.18),
+        "XLB": (0.08, 0.20), "XLC": (0.11, 0.22),
+        "SPY": (0.10, 0.16), "SHY": (0.02, 0.02),
+    }
+
+    # Common market factor
+    market_noise = np.random.normal(0, 1, n)
+    data = {}
+    for ticker in all_tickers:
+        drift, vol = params.get(ticker, (0.08, 0.18))
+        daily_drift = drift / 252
+        daily_vol = vol / np.sqrt(252)
+        # 60% common factor + 40% idiosyncratic
+        idio = np.random.normal(0, 1, n)
+        combined = 0.6 * market_noise + 0.4 * idio
+        log_returns = daily_drift + daily_vol * combined
+        # Add occasional regime shifts for realism
+        regime = np.random.choice([-1, 0, 0, 0, 1], n)
+        log_returns += regime * daily_vol * 0.3
+        prices = 100 * np.exp(np.cumsum(log_returns))
+        data[ticker] = prices
+
+    close = pd.DataFrame(data, index=dates)
+    return close
+
+
 def fetch_data(
     tickers: List[str],
     benchmark: str = BENCHMARK,
     cash: str = CASH_PROXY,
     years: int = 7,
+    offline: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Download adjusted-close prices for sectors, benchmark, and cash proxy.
+
+    Falls back to synthetic data if Yahoo Finance is unreachable or --offline
+    is set.
 
     Returns
     -------
     weekly : pd.DataFrame   – Friday-resampled weekly closes (all tickers + benchmark + cash)
     daily  : pd.DataFrame   – daily closes (for volatility calcs)
     """
-    all_tickers = list(set(tickers + [benchmark, cash]))
-    end = dt.date.today()
-    start = end - dt.timedelta(days=365 * years + 90)  # extra buffer
+    close = None
 
-    print(f"[INFO] Fetching {len(all_tickers)} tickers from {start} to {end} ...")
-    try:
-        raw = yf.download(all_tickers, start=str(start), end=str(end),
-                          auto_adjust=True, progress=False, threads=True)
-    except Exception as exc:
-        sys.exit(f"[ERROR] yfinance download failed: {exc}")
+    if not offline:
+        all_tickers = list(set(tickers + [benchmark, cash]))
+        end = dt.date.today()
+        start = end - dt.timedelta(days=365 * years + 90)  # extra buffer
 
-    if raw.empty:
-        sys.exit("[ERROR] No data returned from yfinance.")
+        print(f"[INFO] Fetching {len(all_tickers)} tickers from {start} to {end} ...")
+        try:
+            raw = yf.download(all_tickers, start=str(start), end=str(end),
+                              auto_adjust=True, progress=False, threads=True)
+            if not raw.empty:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    close = raw["Close"].copy()
+                else:
+                    close = raw.copy()
+        except Exception as exc:
+            print(f"[WARN] yfinance download failed: {exc}")
 
-    # Handle multi-level columns from yfinance
-    if isinstance(raw.columns, pd.MultiIndex):
-        close = raw["Close"].copy()
-    else:
-        close = raw.copy()
+    if close is None or close.empty:
+        print("[INFO] Using synthetic data (Yahoo Finance unavailable or --offline mode).")
+        print("[INFO] Results are illustrative only — connect to the internet for live signals.")
+        close = _generate_synthetic_data(tickers, benchmark, cash, years)
 
     # Drop tickers with >20% missing
     thresh = len(close) * 0.80
@@ -233,10 +289,12 @@ def factor_scores(
             vol_20d[ticker] = d.std() * np.sqrt(252) if len(d) > 1 else 0.2
 
         # --- Value / Quality / Size proxies via yfinance.info ---
-        try:
-            info = yf.Ticker(ticker).info or {}
-        except Exception:
-            info = {}
+        info: dict = {}
+        if api_key is not None or api_key is None:
+            try:
+                info = yf.Ticker(ticker).info or {}
+            except Exception:
+                info = {}
 
         # Value: inverse forward P/E  (fallback: inverse trailing P/E, or 0)
         fpe = info.get("forwardPE") or info.get("trailingPE")
@@ -908,10 +966,12 @@ def main() -> None:
                         help="Years of history to fetch")
     parser.add_argument("--no_plot", action="store_true",
                         help="Suppress plot generation")
+    parser.add_argument("--offline", action="store_true",
+                        help="Use synthetic data (skip Yahoo Finance download)")
     args = parser.parse_args()
 
     # --- Fetch Data ---
-    weekly, daily = fetch_data(SECTOR_TICKERS, years=args.years)
+    weekly, daily = fetch_data(SECTOR_TICKERS, years=args.years, offline=args.offline)
 
     # --- RRG ---
     rrg_df = compute_rrg(weekly, SECTOR_TICKERS, BENCHMARK,
